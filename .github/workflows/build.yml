@@ -48,6 +48,9 @@ jobs:
       - name: Compute image tags
         id: tags
         run: |
+          # github.repository keeps the org's capitalization (DevalexLLC/...),
+          # but registry image names must be lowercase.
+          REGISTRY_IMAGE=${REGISTRY_IMAGE,,}
           tags="$REGISTRY_IMAGE:$VCF_CLI_VERSION"
           if [ "${{ github.ref_type }}" = "tag" ]; then
             # Release tag like v9.0.2-1 -> additional revision tag 9.0.2-1.
