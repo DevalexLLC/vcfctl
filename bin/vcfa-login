@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Log in to a VCF Automation (VCFA) fronted VKS environment via a CCI context,
+# optionally selecting a project/namespace context and pulling a workload
+# cluster kubeconfig (JWT authenticator registration included).
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: vcfa-login -e <vcfa-fqdn> -o <org> [options]
+
+Log in to VCF Automation (Cloud Consumption Interface) with an API token.
+The CA certificate is required by the CLI for cci contexts; by default it is
+fetched from the endpoint automatically.
+
+Required:
+  -e <vcfa-fqdn>     VCF Automation endpoint FQDN
+  -o <org>           Tenant/organization name
+
+Options:
+  -n <name>          Context name (default: derived from endpoint and org)
+  -p <project>       Project name (with -s: switch to that context)
+  -s <namespace>     Namespace name (with -p: switch to that context)
+  -c <cluster>       VKS cluster: register JWT authenticator + get kubeconfig
+  --ca <file>        CA certificate file (instead of fetching it)
+  --fetch-ca         Fetch the CA from the endpoint (default behavior)
+  --insecure         Skip TLS verification (insecure)
+  --refresh          Refresh contexts (pick up namespaces added after login)
+  -h, --help         Show this help
+
+API token: set VCF_CLI_VCFA_API_TOKEN, or you will be prompted.
+Generate one in VCFA: username (top right) -> User Settings -> My Account
+-> API Tokens -> Generate.
+
+Examples:
+  vcfa-login -e vcfa.example.com -o acme
+  vcfa-login -e vcfa.example.com -o acme -s acme-ns1-rmxbk -p default-project -c dev-cluster
+  vcfa-login -e vcfa.example.com -o acme --refresh
+EOF
+}
+
+endpoint="" org="" name="" project="" namespace="" cluster=""
+ca_file="" insecure=false refresh=false
+
+while [ $# -gt 0 ]; do
+    # Value-bearing options: guard $2 before reading it (set -u would abort
+    # with an "unbound variable" error instead of a usage error).
+    case "$1" in
+        -e|-o|-n|-p|-s|-c|--ca)
+            if [ $# -lt 2 ]; then
+                echo "vcfa-login: option $1 requires a value" >&2
+                exit 64
+            fi ;;
+    esac
+    case "$1" in
+        -e) endpoint=$2; shift 2 ;;
+        -o) org=$2; shift 2 ;;
+        -n) name=$2; shift 2 ;;
+        -p) project=$2; shift 2 ;;
+        -s) namespace=$2; shift 2 ;;
+        -c) cluster=$2; shift 2 ;;
+        --ca) ca_file=$2; shift 2 ;;
+        --fetch-ca) shift ;;
+        --insecure) insecure=true; shift ;;
+        --refresh) refresh=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "vcfa-login: unknown argument: $1" >&2; usage >&2; exit 64 ;;
+    esac
+done
+
+if [ -z "$endpoint" ] || [ -z "$org" ]; then
+    echo "vcfa-login: -e and -o are required" >&2
+    usage >&2
+    exit 64
+fi
+if { [ -n "$project" ] && [ -z "$namespace" ]; } || { [ -z "$project" ] && [ -n "$namespace" ]; }; then
+    echo "vcfa-login: -p and -s must be used together" >&2
+    exit 64
+fi
+if [ -n "$cluster" ] && [ -z "$namespace" ]; then
+    echo "vcfa-login: -c requires -p <project> and -s <namespace>" >&2
+    exit 64
+fi
+
+hostport=${endpoint#https://}; hostport=${hostport#http://}; hostport=${hostport%%/*}
+case $hostport in
+    \[*)  # bracketed IPv6 literal, e.g. [2001:db8::1]:8443
+        host=${hostport%%]*}; host=${host#\[}
+        port=${hostport##*\]}; port=${port#:}
+        ;;
+    *)
+        host=${hostport%%:*}
+        port=${hostport#"$host"}; port=${port#:}   # empty if no port given
+        ;;
+esac
+
+sanitize() { printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | sed 's/^-*//; s/-*$//'; }
+
+# Default name includes the org: two tenants on the same VCFA endpoint must
+# not silently reuse each other's context. A short hash of the raw tuple keeps
+# names distinct even when sanitizing collides (e.g. orgs differing only by
+# '.' vs '-').
+if [ -z "$name" ]; then
+    name="$(sanitize "$hostport")-$(sanitize "$org")-$(printf '%s' "${hostport}|${org}" | sha256sum | cut -c1-6)"
+fi
+
+if [ -z "${VCF_CLI_VCFA_API_TOKEN:-}" ]; then
+    if [ -t 0 ]; then
+        read -rsp "VCFA API token for ${org}@${host}: " VCF_CLI_VCFA_API_TOKEN; echo
+        export VCF_CLI_VCFA_API_TOKEN
+    else
+        echo "vcfa-login: VCF_CLI_VCFA_API_TOKEN is not set and no TTY to prompt" >&2
+        exit 64
+    fi
+fi
+
+args=(context create "$name" --endpoint "https://${hostport}" --type cci
+      --auth-type basic --tenant-name "$org")
+
+if [ "$insecure" = true ]; then
+    args+=(--insecure-skip-tls-verify)
+else
+    if [ -z "$ca_file" ]; then
+        cert_dir="$HOME/.config/vcfctl/certs"
+        mkdir -p "$cert_dir"
+        # Filename carries a hash of the raw endpoint (sanitizing collides,
+        # e.g. edge-prod:443 vs edge-prod-443) and is replaced atomically so a
+        # failed fetch never truncates a previously good certificate.
+        ca_file="$cert_dir/$(printf '%s' "$hostport" | tr -c 'a-zA-Z0-9.-' '-')-$(printf '%s' "$hostport" | sha256sum | cut -c1-6).crt"
+        echo "[vcfctl] Fetching CA certificate from ${hostport} -> ${ca_file}"
+        tmp_ca=$(mktemp "${cert_dir}/.fetch-XXXXXX")
+        if ! fetch-ca "$host" ${port:+"$port"} > "$tmp_ca"; then
+            rm -f "$tmp_ca"
+            exit 1
+        fi
+        mv "$tmp_ca" "$ca_file"
+    fi
+    args+=(--ca-certificate "$ca_file")
+fi
+
+reused=false
+if vcf context list -o json 2>/dev/null | jq -r '.[].name? // empty' | grep -qFx -- "$name"; then
+    echo "[vcfctl] Context '${name}' already exists, reusing it — create-time options (--ca/--insecure) are NOT re-applied (vcf context delete ${name} to recreate)"
+    reused=true
+else
+    echo "[vcfctl] Creating cci context '${name}' for https://${hostport} (org: ${org})"
+    vcf "${args[@]}"
+fi
+
+if [ "$reused" = true ] && [ "$refresh" != true ]; then
+    # Re-authenticate in case the stored token expired; consumes the freshly
+    # provided API token. (--refresh below performs its own refresh.)
+    vcf context refresh "$name"
+fi
+
+if [ "$refresh" = true ]; then
+    echo "[vcfctl] Refreshing contexts"
+    vcf config set env.VCF_CLI_CONTEXT_REFRESH_EXPIRY_CHECK_SKIP true
+    vcf context refresh "$name"
+fi
+
+if [ -n "$namespace" ]; then
+    ctx="${name}:${namespace}:${project}"
+    echo "[vcfctl] Switching to context ${ctx}"
+    vcf context use "$ctx"
+else
+    vcf context use "$name"
+fi
+
+if [ -n "$cluster" ]; then
+    echo "[vcfctl] Registering JWT authenticator for cluster '${cluster}'"
+    vcf cluster register-vcfa-jwt-authenticator "$cluster"
+    echo "[vcfctl] Fetching kubeconfig for cluster '${cluster}'"
+    vcf cluster kubeconfig get "$cluster"
+fi
+
+echo
+echo "[vcfctl] Done. VCF contexts:"
+vcf context list
+echo
+echo "[vcfctl] kubectl contexts (kubectl config use-context <name> to switch):"
+kubectl config get-contexts

@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Log in to a vSphere Supervisor directly (no VCF Automation) as an SSO user.
+# Wraps: vcf context create --type k8s --auth-type basic
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: supervisor-login -e <endpoint> -u <user@domain> [options]
+
+Log in to a vSphere Supervisor as a vCenter SSO user and set the resulting
+context as current. Optionally target a VKS workload cluster directly.
+
+Required:
+  -e <endpoint>      Supervisor IP or FQDN (https:// prefixed automatically)
+  -u <user@domain>   vCenter SSO username
+
+Options:
+  -n <name>          Context name (default: derived from endpoint and username)
+  -c <cluster>       Workload cluster name to log into directly
+  -s <namespace>     vSphere Namespace of the workload cluster (with -c)
+  --ca <file>        CA certificate file for the endpoint
+  --fetch-ca         Fetch the endpoint's CA automatically (self-signed labs)
+  --insecure         Skip TLS verification (insecure)
+  -h, --help         Show this help
+
+Password: set VCF_CLI_VSPHERE_PASSWORD, or you will be prompted.
+
+Examples:
+  supervisor-login -e supervisor.example.com -u admin@vsphere.local --fetch-ca
+  supervisor-login -e 10.0.0.10 -u dev@corp.example --insecure -c my-cluster -s my-ns
+EOF
+}
+
+endpoint="" username="" name="" cluster="" namespace=""
+ca_file="" do_fetch_ca=false insecure=false
+
+while [ $# -gt 0 ]; do
+    # Value-bearing options: guard $2 before reading it (set -u would abort
+    # with an "unbound variable" error instead of a usage error).
+    case "$1" in
+        -e|-u|-n|-c|-s|--ca)
+            if [ $# -lt 2 ]; then
+                echo "supervisor-login: option $1 requires a value" >&2
+                exit 64
+            fi ;;
+    esac
+    case "$1" in
+        -e) endpoint=$2; shift 2 ;;
+        -u) username=$2; shift 2 ;;
+        -n) name=$2; shift 2 ;;
+        -c) cluster=$2; shift 2 ;;
+        -s) namespace=$2; shift 2 ;;
+        --ca) ca_file=$2; shift 2 ;;
+        --fetch-ca) do_fetch_ca=true; shift ;;
+        --insecure) insecure=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "supervisor-login: unknown argument: $1" >&2; usage >&2; exit 64 ;;
+    esac
+done
+
+if [ -z "$endpoint" ] || [ -z "$username" ]; then
+    echo "supervisor-login: -e and -u are required" >&2
+    usage >&2
+    exit 64
+fi
+if [ -n "$cluster" ] && [ -z "$namespace" ]; then
+    echo "supervisor-login: -c requires -s <namespace>" >&2
+    exit 64
+fi
+if [ -n "$namespace" ] && [ -z "$cluster" ]; then
+    echo "supervisor-login: -s requires -c <cluster> (a namespace only applies to a workload cluster login)" >&2
+    exit 64
+fi
+
+hostport=${endpoint#https://}; hostport=${hostport#http://}; hostport=${hostport%%/*}
+case $hostport in
+    \[*)  # bracketed IPv6 literal, e.g. [2001:db8::1]:8443
+        host=${hostport%%]*}; host=${host#\[}
+        port=${hostport##*\]}; port=${port#:}
+        ;;
+    *)
+        host=${hostport%%:*}
+        port=${hostport#"$host"}; port=${port#:}   # empty if no port given
+        ;;
+esac
+
+sanitize() { printf '%s' "$1" | tr -c 'a-zA-Z0-9-' '-' | sed 's/^-*//; s/-*$//'; }
+
+# Default name includes the username (two identities on one endpoint must not
+# reuse each other's context) and, when targeting a workload cluster, the
+# namespace/cluster (cluster options are baked into `context create`, so a
+# base-Supervisor context must not be reused for a cluster login). A short
+# hash of the raw tuple keeps names distinct even when sanitizing collides
+# (e.g. usernames differing only by '.' vs '-').
+if [ -z "$name" ]; then
+    tuple_hash=$(printf '%s' "${hostport}|${username}|${namespace}|${cluster}" | sha256sum | cut -c1-6)
+    name="$(sanitize "$hostport")-$(sanitize "$username")"
+    if [ -n "$cluster" ]; then
+        name="$name-$(sanitize "$namespace")-$(sanitize "$cluster")"
+    fi
+    name="$name-$tuple_hash"
+fi
+
+if [ -z "${VCF_CLI_VSPHERE_PASSWORD:-}" ]; then
+    if [ -t 0 ]; then
+        read -rsp "Password for ${username}: " VCF_CLI_VSPHERE_PASSWORD; echo
+        export VCF_CLI_VSPHERE_PASSWORD
+    else
+        echo "supervisor-login: VCF_CLI_VSPHERE_PASSWORD is not set and no TTY to prompt" >&2
+        exit 64
+    fi
+fi
+
+args=(context create "$name" --endpoint "https://${hostport}" --type k8s
+      --auth-type basic --username "$username")
+
+if [ "$insecure" = true ]; then
+    args+=(--insecure-skip-tls-verify)
+elif [ "$do_fetch_ca" = true ]; then
+    cert_dir="$HOME/.config/vcfctl/certs"
+    mkdir -p "$cert_dir"
+    # Filename carries a hash of the raw endpoint (sanitizing collides, e.g.
+    # edge-prod:443 vs edge-prod-443) and is replaced atomically so a failed
+    # fetch never truncates a previously good certificate.
+    ca_file="$cert_dir/$(printf '%s' "$hostport" | tr -c 'a-zA-Z0-9.-' '-')-$(printf '%s' "$hostport" | sha256sum | cut -c1-6).crt"
+    echo "[vcfctl] Fetching CA certificate from ${hostport} -> ${ca_file}"
+    tmp_ca=$(mktemp "${cert_dir}/.fetch-XXXXXX")
+    if ! fetch-ca "$host" ${port:+"$port"} > "$tmp_ca"; then
+        rm -f "$tmp_ca"
+        exit 1
+    fi
+    mv "$tmp_ca" "$ca_file"
+fi
+if [ -n "$ca_file" ]; then
+    args+=(--ca-certificate "$ca_file")
+fi
+if [ -n "$cluster" ]; then
+    args+=(--workload-cluster-name "$cluster" --workload-cluster-namespace "$namespace")
+fi
+
+if vcf context list -o json 2>/dev/null | jq -r '.[].name? // empty' | grep -qFx -- "$name"; then
+    echo "[vcfctl] Context '${name}' already exists, reusing it — create-time options (-c/-s/--ca/--insecure) are NOT re-applied (vcf context delete ${name} to recreate)"
+    # Re-authenticate in case the stored credentials expired; consumes the
+    # freshly provided password.
+    vcf context refresh "$name"
+else
+    echo "[vcfctl] Creating context '${name}' for https://${hostport}"
+    vcf "${args[@]}"
+fi
+vcf context use "$name"
+
+echo
+echo "[vcfctl] Logged in. Current contexts:"
+kubectl config get-contexts

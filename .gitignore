@@ -1,0 +1,6 @@
+*.tar.gz
+*.crt
+*.pem
+dist/
+.idea/
+.vscode/

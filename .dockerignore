@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.dockerignore
+test
+README.md
+NOTICE
+LICENSE
+Makefile
+CLAUDE.md
+*.tar.gz

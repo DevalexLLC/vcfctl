@@ -1,0 +1,102 @@
+name: upstream-check
+
+# Weekly probe for new upstream releases (VCF CLI, VCF plugin bundle, kubectl
+# patch). Opens a PR bumping versions.env; build.yml validates the bump.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe upstream versions
+        id: probe
+        run: |
+          set -euo pipefail
+          source versions.env
+
+          base="https://packages.broadcom.com/artifactory/vcf-distro"
+
+          exists() { [ "$(curl -sI -o /dev/null -w '%{http_code}' --max-time 30 "$1")" = "200" ]; }
+          # The push workflow builds amd64+arm64: only propose versions with BOTH present.
+          exists_all_arches() { exists "${1//ARCH/amd64}" && exists "${1//ARCH/arm64}"; }
+
+          # Enumerate published versions directly from the Artifactory directory
+          # listing (no guessing — arbitrary version skips like the historical
+          # 5.0.0 -> 9.0.0 jump are found), keep the newest one present for
+          # BOTH arches, and fall back to the current version on any failure.
+          latest_version() { # $1=current x.y.z, $2=listing URL, $3=url template with VER/ARCH
+            local cur=$1 listing=$2 tmpl=$3 v best
+            best=$cur
+            for v in $(curl -fsSL --max-time 30 "$listing" \
+                | grep -oE 'href="v[0-9]+\.[0-9]+\.[0-9]+/"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV || true); do
+              if [ "$v" != "$best" ] \
+                 && [ "$(printf '%s\n%s\n' "$best" "$v" | sort -V | tail -1)" = "$v" ] \
+                 && exists_all_arches "${tmpl//VER/$v}"; then
+                best=$v
+              fi
+            done
+            echo "$best"
+          }
+
+          new_cli=$(latest_version "$VCF_CLI_VERSION" "$base/vcf-cli/linux/amd64/" "$base/vcf-cli/linux/ARCH/vVER/vcf-cli.tar.gz")
+          new_plugins=$(latest_version "$VCF_PLUGIN_BUNDLE_VERSION" "$base/vcf-cli-plugins/" "$base/vcf-cli-plugins/vVER/linux/ARCH/plugins.tar.gz")
+
+          # kubectl: track the latest patch of the pinned minor only (skew policy)
+          minor=${KUBECTL_VERSION%.*}
+          new_kubectl=$(curl -fsSL --max-time 30 "https://dl.k8s.io/release/stable-${minor}.txt")
+          new_kubectl=${new_kubectl#v}
+
+          {
+            echo "VCF_CLI_VERSION: $VCF_CLI_VERSION -> $new_cli"
+            echo "VCF_PLUGIN_BUNDLE_VERSION: $VCF_PLUGIN_BUNDLE_VERSION -> $new_plugins"
+            echo "KUBECTL_VERSION: $KUBECTL_VERSION -> $new_kubectl"
+          } | tee probe.txt
+
+          changed=false
+          if [ "$new_cli" != "$VCF_CLI_VERSION" ] || \
+             [ "$new_plugins" != "$VCF_PLUGIN_BUNDLE_VERSION" ] || \
+             [ "$new_kubectl" != "$KUBECTL_VERSION" ]; then
+            changed=true
+            sed -i \
+              -e "s/^VCF_CLI_VERSION=.*/VCF_CLI_VERSION=$new_cli/" \
+              -e "s/^VCF_PLUGIN_BUNDLE_VERSION=.*/VCF_PLUGIN_BUNDLE_VERSION=$new_plugins/" \
+              -e "s/^KUBECTL_VERSION=.*/KUBECTL_VERSION=$new_kubectl/" \
+              versions.env
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      # PRs opened with GITHUB_TOKEN do not trigger other workflows (no build.yml
+      # run), so validate the bumped versions right here before opening the PR.
+      - name: Validate bumped versions (build + smoke)
+        if: steps.probe.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          source versions.env
+          docker buildx build --load \
+            --build-arg VCF_CLI_VERSION="$VCF_CLI_VERSION" \
+            --build-arg VCF_PLUGIN_BUNDLE_VERSION="$VCF_PLUGIN_BUNDLE_VERSION" \
+            --build-arg KUBECTL_VERSION="$KUBECTL_VERSION" \
+            -t vcfctl:bump .
+          IMAGE=vcfctl:bump ./test/smoke.sh
+          echo "" >> probe.txt
+          echo "Validated in this workflow run: amd64 build + full smoke suite passed." >> probe.txt
+
+      - name: Open PR with version bump
+        if: steps.probe.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: bot/upstream-bump
+          commit-message: "chore: bump upstream versions"
+          title: "chore: bump upstream versions"
+          body-path: probe.txt
+          add-paths: versions.env

@@ -1,0 +1,27 @@
+vcfctl
+Copyright devalex LLC
+
+Project code (Dockerfile, scripts, workflows, documentation) is licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+This project's container image redistributes the following third-party
+software, unmodified:
+
+1. Broadcom VMware Cloud Foundation (VCF) CLI and VCF CLI plugins
+   Downloaded at image build time from Broadcom's public package server
+   (https://packages.broadcom.com/artifactory/vcf-distro/), checksum-verified,
+   and included solely to facilitate use with Broadcom VMware Cloud Foundation
+   products by licensed customers. These binaries are the property of
+   Broadcom Inc. and their use is governed by the applicable Broadcom/VMware
+   license terms (see https://github.com/vmware/vcf-cli). This project is not
+   affiliated with, sponsored, or endorsed by Broadcom Inc. If you are a
+   rightsholder and want content removed, open an issue at
+   https://github.com/devalexllc/vcfctl/issues and it will be removed
+   promptly.
+
+2. kubectl
+   Copyright The Kubernetes Authors, licensed under the Apache License 2.0.
+   https://github.com/kubernetes/kubernetes
+
+3. Debian GNU/Linux base image packages, under their respective licenses
+   (https://www.debian.org/legal/licenses/).

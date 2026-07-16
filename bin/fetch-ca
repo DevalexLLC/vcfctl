@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Print the CA certificate (last cert of the presented chain) of a TLS
+# endpoint as PEM on stdout. Composable: fetch-ca vcfa.corp > ca.crt
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: fetch-ca <host> [port]
+
+Connects to <host>:[port] (default 443) and prints the last certificate of
+the server's presented chain — normally the CA — as PEM on stdout.
+
+Example:
+  fetch-ca vcfa.example.com > vcfa-ca.crt
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    "") usage >&2; exit 64 ;;
+esac
+
+host=$1
+port=${2:-443}
+
+# Bare IPv6 literals need brackets for -connect and carry no SNI name.
+connect_host=$host
+sni_args=(-servername "$host")
+case $host in
+    *:*) connect_host="[$host]"; sni_args=() ;;
+esac
+
+# `timeout 15`: openssl has no connect deadline — against a firewall that
+# silently drops traffic it would block for the kernel's multi-minute TCP
+# retry period. `|| true`: a connect failure must fall through to the clear
+# error below, not silently kill the script via pipefail inside the
+# substitution.
+cert=$(echo | timeout 15 openssl s_client -showcerts -connect "${connect_host}:${port}" "${sni_args[@]}" 2>/dev/null \
+    | awk '/-----BEGIN CERTIFICATE-----/{c=""; f=1} f{c=c $0 "\n"} /-----END CERTIFICATE-----/{f=0; last=c} END{printf "%s", last}' \
+    || true)
+
+if [ -z "$cert" ]; then
+    echo "fetch-ca: could not retrieve a certificate from ${host}:${port}" >&2
+    exit 1
+fi
+printf '%s' "$cert"
