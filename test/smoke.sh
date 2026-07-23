@@ -85,7 +85,7 @@ else
 fi
 
 echo "[7] helper scripts respond offline"
-for cmd in "supervisor-login --help" "vcfa-login --help" "fetch-ca --help" "vcfctl-help"; do
+for cmd in "supervisor-login --help" "vcfa-login --help" "tkgs-login --help" "fetch-ca --help" "vcfctl-help"; do
     # shellcheck disable=SC2086
     if offline $cmd >/dev/null 2>&1; then
         pass "$cmd"
@@ -94,7 +94,65 @@ for cmd in "supervisor-login --help" "vcfa-login --help" "fetch-ca --help" "vcfc
     fi
 done
 
-echo "[8] runs as non-root uid 1000"
+echo "[8] tkgs-login prerequisites and offline behavior"
+if offline sh -c 'command -v unzip' >/dev/null 2>&1; then
+    pass "unzip present"
+else
+    fail "unzip missing"
+fi
+offline tkgs-login -e 203.0.113.1 >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 64 ]; then
+    pass "usage error (missing -u) exits 64"
+else
+    fail "usage error: expected rc=64, got rc=$rc"
+fi
+# Install-phase curl must fail instantly with no network — never hang.
+if timeout 60 docker run --rm --network=none "$IMAGE" \
+    tkgs-login -e 203.0.113.1 -u smoke@test --insecure >/dev/null 2>&1; then
+    fail "tkgs-login unexpectedly succeeded offline"
+else
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+        fail "tkgs-login hung offline (timeout)"
+    else
+        pass "failed fast offline with rc=$rc"
+    fi
+fi
+
+echo "[9] PATH contract for runtime-installed tools"
+out=$(offline sh -c 'command -v kubectl')
+if [ "$out" = "/usr/local/bin/kubectl" ]; then
+    pass "default kubectl is the image binary"
+else
+    fail "default kubectl resolves to: $out"
+fi
+out=$(offline bash -c 'mkdir -p ~/.local/tkgs/bin \
+    && printf "#!/bin/sh\necho SHADOW\n" > ~/.local/tkgs/bin/kubectl \
+    && chmod +x ~/.local/tkgs/bin/kubectl && kubectl')
+if [ "$out" = "SHADOW" ]; then
+    pass ".local/tkgs/bin shadows the image kubectl when populated"
+else
+    fail "tkgs kubectl shadow: got '$out'"
+fi
+# Login shells too: Debian's /etc/profile resets PATH, profile-vcfctl.sh must
+# restore the runtime-tool entries (the image's default CMD is a login shell).
+out=$(offline bash -lc 'command -v kubectl')
+if [ "$out" = "/usr/local/bin/kubectl" ]; then
+    pass "login shell: default kubectl is the image binary"
+else
+    fail "login shell: default kubectl resolves to: $out"
+fi
+out=$(offline bash -lc 'mkdir -p ~/.local/tkgs/bin \
+    && printf "#!/bin/sh\necho SHADOW\n" > ~/.local/tkgs/bin/kubectl \
+    && chmod +x ~/.local/tkgs/bin/kubectl && kubectl')
+if [ "$out" = "SHADOW" ]; then
+    pass "login shell: .local/tkgs/bin shadows when populated"
+else
+    fail "login shell tkgs kubectl shadow: got '$out'"
+fi
+
+echo "[10] runs as non-root uid 1000"
 uid=$(docker run --rm "$IMAGE" id -u)
 if [ "$uid" = "1000" ]; then
     pass "uid=1000"

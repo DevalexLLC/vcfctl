@@ -7,13 +7,15 @@ KUBECTL_VERSION=$(kubectl version --client 2>/dev/null | awk '/Client Version:/{
 
 cat <<EOF
 ─────────────────────────────────────────────────────────────────────
- vcfctl — VCF 9 VKS toolbox (air-gap ready)
+ vcfctl — VCF 9 & vSphere 8 VKS toolbox (air-gap ready)
  vcf ${VCF_VERSION:-?} · kubectl ${KUBECTL_VERSION:-?} · all VCF plugins preinstalled
 
  Log in to a VKS environment:
-   supervisor-login -e <supervisor-fqdn> -u <user@domain>   direct Supervisor
+   supervisor-login -e <supervisor-fqdn> -u <user@domain>   direct Supervisor (VCF 9)
    vcfa-login -e <vcfa-fqdn> -o <org>                       VCF Automation (CCI)
-   Add --help to either command for all options.
+   tkgs-login -e <supervisor-ip> -u <user@domain>           vSphere 8 / TKGS (installs
+                                 kubectl-vsphere from your Supervisor on first use)
+   Add --help to any command for all options.
 
  Useful:
    vcf context list / use        manage VCF contexts

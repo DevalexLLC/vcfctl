@@ -51,7 +51,7 @@ ARG VCF_PLUGIN_BUNDLE_VERSION
 ARG KUBECTL_VERSION
 
 LABEL org.opencontainers.image.title="vcfctl" \
-      org.opencontainers.image.description="Broadcom VCF 9 CLI with all plugins, kubectl, and login helpers for connecting to VCF 9 VKS environments — built for disconnected/air-gapped use" \
+      org.opencontainers.image.description="Broadcom VCF 9 CLI with all plugins, kubectl, and login helpers for VCF 9 VKS and vSphere 8 TKGS environments — built for disconnected/air-gapped use" \
       org.opencontainers.image.source="https://github.com/devalexllc/vcfctl" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VCF_CLI_VERSION}" \
@@ -61,7 +61,7 @@ LABEL org.opencontainers.image.title="vcfctl" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        bash ca-certificates curl openssl openssh-client jq less bash-completion \
+        bash ca-certificates curl openssl openssh-client jq less bash-completion unzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=fetch /fetch/vcf /fetch/kubectl /usr/local/bin/
@@ -79,7 +79,15 @@ RUN groupadd -g 1000 vcfctl \
 ENV VCF_CLI_SKIP_CONTEXT_RECOMMENDED_PLUGIN_INSTALLATION=true \
     VCF_CLI_PLUGIN_DB_CACHE_TTL_SECONDS=315360000 \
     HOME=/home/vcfctl \
-    KUBECONFIG=/home/vcfctl/.kube/config
+    KUBECONFIG=/home/vcfctl/.kube/config \
+    PATH=/home/vcfctl/.local/tkgs/bin:/home/vcfctl/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# PATH contract for runtime-installed vSphere 8 tools (tkgs-login): both home
+# dirs are absent until tkgs-login creates them, so by default the image
+# kubectl resolves everywhere. ~/.local/bin holds kubectl-vsphere and must
+# never contain a kubectl; ~/.local/tkgs/bin holds the opt-in
+# Supervisor-matched kubectl, which shadows the image one exactly when the
+# user asked for it. ENV (not skel .profile) so one-shot `docker run` and
+# `docker exec` resolve them too.
 
 USER vcfctl
 WORKDIR /home/vcfctl
@@ -118,11 +126,11 @@ RUN --mount=type=bind,from=fetch,source=/fetch/plugins,target=/tmp/vcf-plugins \
     && echo "${VCF_CLI_VERSION}+plugins${VCF_PLUGIN_BUNDLE_VERSION}+${skel_digest}" > /opt/vcfctl/skel/.vcfctl-version
 
 USER root
-COPY docker/entrypoint.sh docker/motd.sh bin/supervisor-login bin/vcfa-login bin/fetch-ca bin/vcfctl-help /usr/local/bin/
+COPY docker/entrypoint.sh docker/motd.sh bin/supervisor-login bin/vcfa-login bin/tkgs-login bin/fetch-ca bin/vcfctl-help /usr/local/bin/
 COPY docker/profile-vcfctl.sh /etc/profile.d/vcfctl.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/motd.sh \
         /usr/local/bin/supervisor-login /usr/local/bin/vcfa-login \
-        /usr/local/bin/fetch-ca /usr/local/bin/vcfctl-help
+        /usr/local/bin/tkgs-login /usr/local/bin/fetch-ca /usr/local/bin/vcfctl-help
 
 USER vcfctl
 

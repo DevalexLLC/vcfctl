@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# Log in to a vSphere 8 Supervisor (TKG Service / TKGS) via kubectl-vsphere,
+# installing the Kubernetes CLI Tools from the Supervisor itself on first use.
+# The tools have no public download: each Supervisor serves its own
+# version-matched vsphere-plugin.zip (x86_64 only, no published checksums).
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: tkgs-login -e <endpoint> -u <user@domain> [options]
+
+Log in to a vSphere 8 Supervisor (TKG Service) as a vCenter SSO user via the
+kubectl-vsphere plugin. On first use the CLI tools are downloaded from the
+Supervisor itself (https://<endpoint>/wcp/plugin/linux-amd64/vsphere-plugin.zip)
+and installed under ~/.local — they persist in a mounted home volume.
+
+Required:
+  -e <endpoint>      Supervisor IP or FQDN (https:// prefixed automatically)
+  -u <user@domain>   vCenter SSO username (not required with --install-only)
+
+Options:
+  -c <cluster>       Workload (TKG) cluster name to log into directly
+  -s <namespace>     vSphere Namespace of the workload cluster (with -c)
+  --ca <file>        CA certificate file for the endpoint
+  --fetch-ca         Fetch the endpoint's CA automatically (self-signed labs)
+  --insecure         Skip TLS verification (insecure)
+  --with-kubectl     Also install the Supervisor-matched kubectl into
+                     ~/.local/tkgs/bin, shadowing the image's kubectl on PATH
+                     (undo with: rm ~/.local/tkgs/bin/kubectl)
+  --force            Re-download the tools even if already installed
+  --install-only     Install the tools from the Supervisor, skip the login
+  -h, --help         Show this help
+
+Password: set KUBECTL_VSPHERE_PASSWORD, or you will be prompted.
+Sessions last ~10 hours; re-run this command to log in again.
+
+Examples:
+  tkgs-login -e supervisor.example.com -u admin@vsphere.local --fetch-ca
+  tkgs-login -e 10.0.0.10 -u dev@corp.example --insecure -c my-cluster -s my-ns
+  tkgs-login -e 10.0.0.10 --install-only --fetch-ca --with-kubectl
+EOF
+}
+
+endpoint="" username="" cluster="" namespace=""
+ca_file="" do_fetch_ca=false insecure=false
+with_kubectl=false force=false install_only=false
+
+while [ $# -gt 0 ]; do
+    # Value-bearing options: guard $2 before reading it (set -u would abort
+    # with an "unbound variable" error instead of a usage error).
+    case "$1" in
+        -e|-u|-c|-s|--ca)
+            if [ $# -lt 2 ]; then
+                echo "tkgs-login: option $1 requires a value" >&2
+                exit 64
+            fi ;;
+    esac
+    case "$1" in
+        -e) endpoint=$2; shift 2 ;;
+        -u) username=$2; shift 2 ;;
+        -c) cluster=$2; shift 2 ;;
+        -s) namespace=$2; shift 2 ;;
+        --ca) ca_file=$2; shift 2 ;;
+        --fetch-ca) do_fetch_ca=true; shift ;;
+        --insecure) insecure=true; shift ;;
+        --with-kubectl) with_kubectl=true; shift ;;
+        --force) force=true; shift ;;
+        --install-only) install_only=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "tkgs-login: unknown argument: $1" >&2; usage >&2; exit 64 ;;
+    esac
+done
+
+if [ -z "$endpoint" ]; then
+    echo "tkgs-login: -e is required" >&2
+    usage >&2
+    exit 64
+fi
+if [ "$install_only" = false ] && [ -z "$username" ]; then
+    echo "tkgs-login: -u is required (or use --install-only)" >&2
+    usage >&2
+    exit 64
+fi
+if [ -n "$cluster" ] && [ -z "$namespace" ]; then
+    echo "tkgs-login: -c requires -s <namespace>" >&2
+    exit 64
+fi
+if [ -n "$namespace" ] && [ -z "$cluster" ]; then
+    echo "tkgs-login: -s requires -c <cluster> (a namespace only applies to a workload cluster login)" >&2
+    exit 64
+fi
+
+# The Supervisor publishes the tools for x86_64 only — neither a fresh
+# download nor a previously installed copy (e.g. an amd64-created home volume
+# mounted into the arm64 image) can ever run elsewhere, so fail up front.
+if [ "$(uname -m)" != "x86_64" ]; then
+    echo "tkgs-login: the vSphere 8 CLI tools are published for x86_64 only; on this host run the amd64 image instead (docker run --platform linux/amd64 ...)" >&2
+    exit 1
+fi
+
+hostport=${endpoint#https://}; hostport=${hostport#http://}; hostport=${hostport%%/*}
+case $hostport in
+    \[*)  # bracketed IPv6 literal, e.g. [2001:db8::1]:8443
+        host=${hostport%%]*}; host=${host#\[}
+        port=${hostport##*\]}; port=${port#:}
+        ;;
+    *)
+        host=${hostport%%:*}
+        port=${hostport#"$host"}; port=${port#:}   # empty if no port given
+        ;;
+esac
+
+plugin_bin="$HOME/.local/bin/kubectl-vsphere"
+tkgs_kubectl="$HOME/.local/tkgs/bin/kubectl"
+cert_dir="$HOME/.config/vcfctl/certs"
+# Trust bundle built below on every run where an endpoint CA is in play:
+# system roots + fetched/provided CAs (always a superset of system trust).
+bundle="$HOME/.config/vcfctl/tkgs-ca-bundle.crt"
+# Records which Supervisor the installed tools came from (they are
+# version-matched to it), so a login against a different endpoint can warn.
+src_marker="$HOME/.config/vcfctl/tkgs-tools-source"
+
+# A previously installed optional kubectl is refreshed alongside the plugin on
+# any (re)install — otherwise --force without repeating --with-kubectl would
+# renew the plugin but leave a stale kubectl shadowing the image one.
+if [ -x "$tkgs_kubectl" ]; then
+    with_kubectl=true
+fi
+
+if [ "$insecure" = false ] && [ "$do_fetch_ca" = true ]; then
+    mkdir -p "$cert_dir"
+    # Filename carries a hash of the raw endpoint (sanitizing collides, e.g.
+    # edge-prod:443 vs edge-prod-443) and is replaced atomically so a failed
+    # fetch never truncates a previously good certificate.
+    ca_file="$cert_dir/$(printf '%s' "$hostport" | tr -c 'a-zA-Z0-9.-' '-')-$(printf '%s' "$hostport" | sha256sum | cut -c1-6).crt"
+    echo "[vcfctl] Fetching CA certificate from ${hostport} -> ${ca_file}"
+    tmp_ca=$(mktemp "${cert_dir}/.fetch-XXXXXX")
+    if ! fetch-ca "$host" ${port:+"$port"} > "$tmp_ca"; then
+        rm -f "$tmp_ca"
+        exit 1
+    fi
+    mv "$tmp_ca" "$ca_file"
+fi
+
+# Which tools still need installing from the Supervisor?
+need_install=false
+if [ "$force" = true ] || [ ! -x "$plugin_bin" ]; then
+    need_install=true
+fi
+if [ "$with_kubectl" = true ] && [ ! -x "$tkgs_kubectl" ]; then
+    need_install=true
+fi
+
+if [ "$need_install" = true ]; then
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    url="https://${hostport}/wcp/plugin/linux-amd64/vsphere-plugin.zip"
+    echo "[vcfctl] Downloading Kubernetes CLI Tools from ${url}"
+    # --connect-timeout: against a firewall that silently drops traffic, curl
+    # would otherwise block for the kernel's multi-minute TCP retry period.
+    # No --max-time: the zip is tens of MB and link speed is unknown.
+    curl_args=(-fsSL --connect-timeout 15 -o "$tmpdir/vsphere-plugin.zip")
+    if [ "$insecure" = true ]; then
+        curl_args+=(-k)
+    elif [ -n "$ca_file" ]; then
+        curl_args+=(--cacert "$ca_file")
+    elif [ -f "$bundle" ]; then
+        # A previous run already established trust (e.g. --fetch-ca) — reuse
+        # it, so a later --force/--with-kubectl download needs no CA flags.
+        curl_args+=(--cacert "$bundle")
+    fi
+    if ! curl "${curl_args[@]}" "$url"; then
+        echo "tkgs-login: download failed from ${hostport}" >&2
+        if [ "$insecure" = false ] && [ -z "$ca_file" ]; then
+            echo "tkgs-login: if this was a TLS error (Supervisors use a self-signed cert by default), retry with --fetch-ca, --ca <file>, or --insecure" >&2
+        fi
+        exit 1
+    fi
+
+    unzip -q "$tmpdir/vsphere-plugin.zip" -d "$tmpdir/zip"
+    for f in bin/kubectl-vsphere bin/kubectl; do
+        if [ ! -f "$tmpdir/zip/$f" ]; then
+            echo "tkgs-login: unexpected vsphere-plugin.zip layout (no $f)" >&2
+            exit 1
+        fi
+    done
+
+    # Atomic install: mktemp in the DESTINATION dir (a /tmp -> $HOME mv would
+    # cross filesystems and not be atomic). The binaries ship unmodified.
+    mkdir -p "$HOME/.local/bin"
+    tmp_bin=$(mktemp "$HOME/.local/bin/.kubectl-vsphere-XXXXXX")
+    cp "$tmpdir/zip/bin/kubectl-vsphere" "$tmp_bin"
+    chmod 0755 "$tmp_bin"
+    mv "$tmp_bin" "$plugin_bin"
+    echo "[vcfctl] Installed ${plugin_bin}"
+
+    # Opt-in only, and NEVER into ~/.local/bin: the Supervisor-matched kubectl
+    # must shadow the image's kubectl exactly when the user asked for it, via
+    # the dedicated ~/.local/tkgs/bin PATH entry.
+    if [ "$with_kubectl" = true ]; then
+        mkdir -p "$HOME/.local/tkgs/bin"
+        tmp_bin=$(mktemp "$HOME/.local/tkgs/bin/.kubectl-XXXXXX")
+        cp "$tmpdir/zip/bin/kubectl" "$tmp_bin"
+        chmod 0755 "$tmp_bin"
+        mv "$tmp_bin" "$tkgs_kubectl"
+        echo "[vcfctl] Installed ${tkgs_kubectl} (shadows the image kubectl; rm it to undo)"
+        echo "[vcfctl] If kubectl was already run in this shell, run 'hash -r' so bash picks up the new binary"
+    fi
+
+    mkdir -p "$HOME/.config/vcfctl"
+    printf '%s\n' "$hostport" > "$src_marker"
+else
+    prev_src=$(cat "$src_marker" 2>/dev/null || true)
+    if [ -n "$prev_src" ] && [ "$prev_src" != "$hostport" ]; then
+        echo "[vcfctl] WARNING: installed tools came from ${prev_src}, not ${hostport} — versions may not match; use --force to refresh from ${hostport}" >&2
+    else
+        echo "[vcfctl] kubectl-vsphere already installed (from a previous Supervisor download) — use --force to refresh from ${hostport}"
+    fi
+fi
+
+# (Re)build the trust bundle for the Go binaries (kubectl-vsphere/kubectl/vcf
+# honor SSL_CERT_FILE): profile-vcfctl.sh exports it ambiently in login
+# shells. Stored OUTSIDE certs/ so a rebuild never includes a previous bundle.
+have_extra_ca=false
+if [ -n "$ca_file" ]; then
+    have_extra_ca=true
+else
+    for f in "$cert_dir"/*.crt; do
+        [ -f "$f" ] && have_extra_ca=true && break
+    done
+fi
+if [ "$have_extra_ca" = true ]; then
+    mkdir -p "$HOME/.config/vcfctl"
+    tmp_bundle=$(mktemp "$HOME/.config/vcfctl/.bundle-XXXXXX")
+    {
+        cat /etc/ssl/certs/ca-certificates.crt
+        [ -n "$ca_file" ] && cat "$ca_file"
+        for f in "$cert_dir"/*.crt; do
+            [ -f "$f" ] || continue
+            cat "$f"
+        done
+    } > "$tmp_bundle"
+    mv "$tmp_bundle" "$bundle"
+fi
+
+if [ "$install_only" = true ]; then
+    exit 0
+fi
+
+# kubectl-vsphere prompts for the password itself on a TTY; only the
+# no-TTY-and-no-env case is hopeless, so fail it before contacting the server.
+if [ -z "${KUBECTL_VSPHERE_PASSWORD:-}" ] && [ ! -t 0 ]; then
+    echo "tkgs-login: KUBECTL_VSPHERE_PASSWORD is not set and no TTY to prompt" >&2
+    exit 64
+fi
+
+args=(login --server "$hostport" --vsphere-username "$username")
+if [ -n "$cluster" ]; then
+    args+=(--tanzu-kubernetes-cluster-name "$cluster" --tanzu-kubernetes-cluster-namespace "$namespace")
+fi
+if [ "$insecure" = true ]; then
+    args+=(--insecure-skip-tls-verify)
+fi
+
+# Absolute path: independent of PATH ordering. SSL_CERT_FILE only when a
+# bundle exists — pointing Go at a missing file degrades root CA loading.
+if [ -f "$bundle" ]; then
+    SSL_CERT_FILE="$bundle" "$plugin_bin" "${args[@]}"
+else
+    "$plugin_bin" "${args[@]}"
+fi
+
+echo
+echo "[vcfctl] Logged in (session lasts ~10 hours; re-run tkgs-login to renew). Current contexts:"
+kubectl config get-contexts

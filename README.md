@@ -2,13 +2,16 @@
 
 [![build](https://github.com/devalexllc/vcfctl/actions/workflows/build.yml/badge.svg)](https://github.com/devalexllc/vcfctl/actions/workflows/build.yml)
 
-**One `docker pull` to a working VCF 9 VKS login toolbox — built for air-gapped environments.**
+**One `docker pull` to a working VKS login toolbox for VCF 9 *and* vSphere 8 — built for
+air-gapped environments.**
 
 VCF 9 replaced `kubectl vsphere` with the `vcf` CLI, which normally installs its plugins from
 Broadcom's online plugin repository — a problem in disconnected environments. This image ships
 the **VCF 9 CLI with every plugin preinstalled**, plus `kubectl` and login helper scripts, all
 preconfigured to work fully offline. Pull the image, run it, log in to your
-vSphere Kubernetes Service (VKS) environment.
+vSphere Kubernetes Service (VKS) environment. For **vSphere 8** Supervisors (TKG Service),
+the `tkgs-login` helper installs the classic `kubectl-vsphere` plugin directly from *your*
+Supervisor on first use — the only place it is distributed — and logs you in.
 
 ```bash
 docker pull ghcr.io/devalexllc/vcfctl:9.0.2
@@ -26,14 +29,14 @@ vcfctl kubectl get pods       # contexts/kubeconfigs persist in the volume
 ```
 
 Nothing is installed on the host — every command in this README (`vcf`, `kubectl`,
-`supervisor-login`, `vcfa-login`, `fetch-ca`) runs **inside the container**: either type it in
-the interactive shell (`vcfctl`), or run it one-shot by prefixing the alias
+`supervisor-login`, `vcfa-login`, `tkgs-login`, `fetch-ca`) runs **inside the container**:
+either type it in the interactive shell (`vcfctl`), or run it one-shot by prefixing the alias
 (`vcfctl supervisor-login ...`). To pass credentials via environment variables in one-shot
 mode, forward them through Docker (an `-e VAR` with no value forwards it only when set):
 
 ```bash
 alias vcfctl='docker run -it --rm -v vcfctl-home:/home/vcfctl \
-    -e VCF_CLI_VSPHERE_PASSWORD -e VCF_CLI_VCFA_API_TOKEN \
+    -e VCF_CLI_VSPHERE_PASSWORD -e VCF_CLI_VCFA_API_TOKEN -e KUBECTL_VSPHERE_PASSWORD \
     ghcr.io/devalexllc/vcfctl:9.0.2'
 ```
 
@@ -46,8 +49,9 @@ Pick the image tag matching your VCF environment version. `latest` tracks the ne
 | `vcf` CLI | 9.0.2 | linux binary from packages.broadcom.com, checksum-verified |
 | VCF CLI plugins | bundle 9.0.0 | **all** plugins: cluster, kubernetes-release, namespaces, package, pais, registry-secret, secret, telemetry, vm, imgpkg |
 | `kubectl` | 1.33.x | compatible with K8s 1.32–1.34 API servers (skew policy) |
-| helpers | — | `supervisor-login`, `vcfa-login`, `fetch-ca`, `vcfctl-help` |
-| tools | — | openssl, ssh client, curl, jq, bash completion |
+| `kubectl-vsphere` | matches your Supervisor | **not baked in** — no public download exists; `tkgs-login` installs it from your vSphere 8 Supervisor on first use (x86_64 only) |
+| helpers | — | `supervisor-login`, `vcfa-login`, `tkgs-login`, `fetch-ca`, `vcfctl-help` |
+| tools | — | openssl, ssh client, curl, jq, unzip, bash completion |
 
 Offline hardening baked in: plugin auto-install at login is disabled
 (`VCF_CLI_SKIP_CONTEXT_RECOMMENDED_PLUGIN_INSTALLATION=true`), the plugin database cache
@@ -58,7 +62,9 @@ command ever attempts to reach Broadcom's registry (on air-gap firewalls that si
 traffic, such attempts would stall). Everything operational (contexts, clusters, kubectl)
 works fully offline; to browse or install additional plugins from a connected network, restore
 the source with `vcf plugin source init`.
-The image runs as a non-root user (uid 1000). Multi-arch: `linux/amd64` and `linux/arm64`.
+The image runs as a non-root user (uid 1000). Multi-arch: `linux/amd64` and `linux/arm64`
+(the vSphere 8 CLI tools are published x86_64-only — on arm64 hosts use
+`docker run --platform linux/amd64` for TKGS work).
 
 ## Log in: direct Supervisor (no VCF Automation)
 
@@ -120,10 +126,59 @@ vcf config set env.VCF_CLI_CONTEXT_REFRESH_EXPIRY_CHECK_SKIP true
 vcf context refresh
 ```
 
+## Log in: vSphere 8 Supervisor (TKG Service / TKGS)
+
+vSphere 8 Supervisors use the classic `kubectl vsphere login` flow instead of the `vcf` CLI.
+Broadcom does not publish the Kubernetes CLI Tools for vSphere anywhere public — each
+Supervisor serves its own version-matched copy at
+`https://<supervisor>/wcp/plugin/linux-amd64/vsphere-plugin.zip` (x86_64 only, no
+checksums), so they cannot be pinned and baked into this image like everything else.
+Instead, `tkgs-login` downloads them from *your* Supervisor on first use, installs them
+into the home volume (where they persist across runs and image upgrades), and logs you in:
+
+```bash
+# First run downloads + installs kubectl-vsphere from the Supervisor, then logs in.
+# Supervisors present a self-signed cert by default; --fetch-ca trusts it explicitly.
+tkgs-login -e 10.0.0.10 -u administrator@vsphere.local --fetch-ca
+
+# Log straight into a workload (TKG) cluster:
+tkgs-login -e 10.0.0.10 -u dev@corp.example --fetch-ca -c my-cluster -s my-namespace
+
+# After a Supervisor upgrade, refresh the tools:
+tkgs-login -e 10.0.0.10 -u admin@vsphere.local --fetch-ca --force
+```
+
+Password comes from `KUBECTL_VSPHERE_PASSWORD` or an interactive prompt. Sessions last
+~10 hours; re-run `tkgs-login` to renew. If CA trust gives you trouble, `--insecure` skips
+TLS verification for both the download and the login.
+
+The image's `kubectl` (1.33) targets VCF 9 clusters and is outside the supported version
+skew for the older Kubernetes releases vSphere 8 runs. `--with-kubectl` additionally
+installs the Supervisor-matched `kubectl` from the same zip into `~/.local/tkgs/bin`,
+which is first on `PATH` — it shadows the image's kubectl until you remove it:
+
+```bash
+tkgs-login -e 10.0.0.10 -u admin@vsphere.local --fetch-ca --with-kubectl
+kubectl version --client            # now reports the Supervisor's kubectl version
+rm ~/.local/tkgs/bin/kubectl        # undo: back to the image's kubectl 1.33
+```
+
+CA trust works without root: fetched CAs are collected into
+`~/.config/vcfctl/tkgs-ca-bundle.crt` (system roots + your Supervisor CAs), which login
+shells export as `SSL_CERT_FILE` so `kubectl` and `kubectl-vsphere` trust your Supervisor
+in later sessions too. Equivalent raw commands, if you prefer to run them yourself:
+
+```bash
+curl -k "https://10.0.0.10/wcp/plugin/linux-amd64/vsphere-plugin.zip" -o vsphere-plugin.zip
+unzip vsphere-plugin.zip && install -m 0755 bin/kubectl-vsphere ~/.local/bin/
+kubectl vsphere login --server=10.0.0.10 --vsphere-username administrator@vsphere.local \
+    --insecure-skip-tls-verify
+```
+
 ## Persistence & upgrades
 
 Mount a volume (or host directory owned by uid 1000) at `/home/vcfctl` to keep VCF contexts,
-kubeconfigs, and fetched CA certs across runs. On start, the entrypoint seeds the baked CLI
+kubeconfigs, fetched CA certs, and the runtime-installed vSphere 8 tools across runs. On start, the entrypoint seeds the baked CLI
 and plugin state into the home if missing or if the image version changed — your contexts and
 config are never overwritten, while plugin binaries update automatically when you pull a newer
 tag.
