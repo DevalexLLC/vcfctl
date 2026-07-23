@@ -56,13 +56,13 @@ fi
 echo "[5] volume-shadow seeding (fresh volume over \$HOME, offline)"
 vol="vcfctl-smoke-$$"
 docker volume create "$vol" >/dev/null
-count=$(docker run --rm --network=none -v "$vol:/home/vcfctl" "$IMAGE" vcf plugin list 2>/dev/null | grep -c installed)
+count=$(docker run --rm --network=none -v "$vol:/home/vcfctl:z" "$IMAGE" vcf plugin list 2>/dev/null | grep -c installed)
 if [ "$count" -eq "${#EXPECTED_PLUGINS[@]}" ]; then
     pass "fresh volume seeded ($count plugins)"
 else
     fail "fresh volume: expected ${#EXPECTED_PLUGINS[@]} plugins, got $count"
 fi
-count=$(docker run --rm --network=none -v "$vol:/home/vcfctl" "$IMAGE" vcf plugin list 2>/dev/null | grep -c installed)
+count=$(docker run --rm --network=none -v "$vol:/home/vcfctl:z" "$IMAGE" vcf plugin list 2>/dev/null | grep -c installed)
 if [ "$count" -eq "${#EXPECTED_PLUGINS[@]}" ]; then
     pass "second run idempotent"
 else

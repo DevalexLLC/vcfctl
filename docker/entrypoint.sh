@@ -24,7 +24,7 @@ if [ ! -w "$HOME" ]; then
     cat >&2 <<'EOF'
 [vcfctl] WARNING: $HOME is not writable; the VCF CLI cannot be initialized.
 [vcfctl] Run the image as its built-in user with a writable home, e.g.:
-[vcfctl]   docker run -it --rm -v vcfctl-home:/home/vcfctl ghcr.io/devalexllc/vcfctl
+[vcfctl]   docker run -it --rm -v vcfctl-home:/home/vcfctl:z ghcr.io/devalexllc/vcfctl
 EOF
 elif [ ! -f "$HOME/$MARKER" ] || ! cmp -s "$HOME/$MARKER" "$SKEL/$MARKER"; then
     seed_home

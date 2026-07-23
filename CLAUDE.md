@@ -19,6 +19,13 @@ plugins + kubectl + login helpers for air-gapped VKS access, plus runtime-instal
 - All shell scripts must be shellcheck-clean (`make lint`), `set -euo pipefail`, with `--help`.
 - Image tags track the bundled VCF CLI version (`9.0.2`, `latest`, `-N` revision suffix for
   image-side rebuilds, git tags like `v9.0.2-1`).
+- All documented/scripted home-volume mounts use the `:z` suffix (README, motd, Makefile,
+  smoke tests, entrypoint warning). Field-verified 2026-07 on RHEL 9.6 + podman: without it, podman on
+  SELinux-enforcing hosts labels volume content with the first container's private MCS
+  categories, and every later container is denied access (even container root) — the CLI
+  panics with "cannot acquire lock for vcf config file, reason: permission denied" at
+  login-shell startup (profile runs `vcf completion bash`). `:z` shared-labels the content
+  each start and heals already-broken volumes; docker on non-SELinux hosts ignores it.
 
 ## Build & test
 

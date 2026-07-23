@@ -21,7 +21,7 @@ test: ## Run the smoke test suite against $(IMAGE)
 	IMAGE=$(IMAGE) ./test/smoke.sh
 
 run: ## Run an interactive shell with a persistent home volume
-	docker run -it --rm -v vcfctl-home:/home/vcfctl $(IMAGE)
+	docker run -it --rm -v vcfctl-home:/home/vcfctl:z $(IMAGE)
 
 shell: run
 

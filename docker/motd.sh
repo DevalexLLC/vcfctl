@@ -26,6 +26,6 @@ cat <<EOF
 
  Persistence: mount a volume at /home/vcfctl to keep contexts and
  kubeconfigs across runs:
-   docker run -it --rm -v vcfctl-home:/home/vcfctl <image>
+   docker run -it --rm -v vcfctl-home:/home/vcfctl:z <image>
 ─────────────────────────────────────────────────────────────────────
 EOF

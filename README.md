@@ -21,7 +21,7 @@ docker pull ghcr.io/devalexllc/vcfctl:9.0.2
 
 ```bash
 docker volume create vcfctl-home
-alias vcfctl='docker run -it --rm -v vcfctl-home:/home/vcfctl ghcr.io/devalexllc/vcfctl:9.0.2'
+alias vcfctl='docker run -it --rm -v vcfctl-home:/home/vcfctl:z ghcr.io/devalexllc/vcfctl:9.0.2'
 
 vcfctl                        # interactive shell with vcf, kubectl, and helpers
 vcfctl vcf context list       # or run any command one-shot
@@ -35,12 +35,20 @@ either type it in the interactive shell (`vcfctl`), or run it one-shot by prefix
 mode, forward them through Docker (an `-e VAR` with no value forwards it only when set):
 
 ```bash
-alias vcfctl='docker run -it --rm -v vcfctl-home:/home/vcfctl \
+alias vcfctl='docker run -it --rm -v vcfctl-home:/home/vcfctl:z \
     -e VCF_CLI_VSPHERE_PASSWORD -e VCF_CLI_VCFA_API_TOKEN -e KUBECTL_VSPHERE_PASSWORD \
     ghcr.io/devalexllc/vcfctl:9.0.2'
 ```
 
 Pick the image tag matching your VCF environment version. `latest` tracks the newest VCF CLI.
+
+Podman works identically — substitute `podman` for `docker` throughout. The `:z` volume
+suffix matters on SELinux-enforcing hosts (RHEL/Fedora): each podman container runs with a
+private SELinux label, and without `:z` the volume content gets labeled for the first
+container only — later runs are denied access and the CLI panics with
+`cannot acquire lock for vcf config file, reason: permission denied`. `:z` keeps the volume
+shared-labeled (and repairs a volume already in that state); Docker on non-SELinux hosts
+ignores it.
 
 ## What's inside
 
